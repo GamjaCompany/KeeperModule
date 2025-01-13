@@ -20,7 +20,7 @@ WiFiClientSecure espClient;
 PubSubClient client(espClient);
 
 /**최초 네트워크 접속 및 MQTT브로커 서버 접속 기능*/
-void setup_wifi() {
+void setup_network() {
     unsigned long trig = millis();
 
     String ssid="", password="";

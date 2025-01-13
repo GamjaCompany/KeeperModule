@@ -12,7 +12,7 @@ void handleRecv(String topic, String payload);
 void setup() {
     Serial.begin(115200);
 
-    setup_wifi();
+    setup_network();
 }
 
 void loop() {
