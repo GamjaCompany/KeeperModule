@@ -1,6 +1,7 @@
 #include "env.h"  // 개인정보(와이파이 ID/PW, MQTT서버 url/ID/PW)
 #include <Arduino.h>
 #include <MqttHandler.h>
+#include <NtpHandler.h>
 
 /** 
  * MQTT메시지 해석 함수
@@ -13,6 +14,7 @@ void setup() {
     Serial.begin(115200);
 
     setup_network();
+    setup_ntp();  // 꼭 setup_network()보다 이후에 위치해야함
 }
 
 void loop() {

@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
+#include <NtpHandler.h>
 
 extern void handleRecv(String topic, String payload);
 
@@ -64,6 +65,7 @@ void setup_network() {
     Serial.println("IP address: ");
     Serial.println(WiFi.localIP());
 
+    setup_ntp();  // NTP활성화
 
     espClient.setInsecure();  // SSL보안을 실제로 쓰지는 않음
     client.setServer(project_env::broker_address, project_env::broker_port);
