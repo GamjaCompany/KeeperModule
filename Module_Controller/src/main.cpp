@@ -5,6 +5,8 @@
 #include <env.h>
 #include <HW_config.h>
 #include <Network_config.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 #define FOR(i, b, e) for(int i = b; i < e; i++)
 
 // 1. 네트워크 연결 되면 5초마다 2번 빠르게 점멸
@@ -18,6 +20,8 @@
 
 void setup() {
     Serial.begin(115200); // 시리얼 통신 초기화
+
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable brownout detector
 
     hw_init();
     env.init();
@@ -55,8 +59,27 @@ void loop() {
 
             return;
         }
+        // 재부팅 지시
+        if (recv == "reboot") {
+            ESP.restart();
+            
+            return;
+        }
+
+        if (recv == "go") {
+            step_motor.activate();
+        
+            return;
+        }
+
+        if (recv == "stop") {
+            step_motor.deactivate();
+        
+            return;
+        }
     }
     
+    step_motor.run();
     net.run();
     #ifdef LED_HANDLER_H
     led.run();

@@ -16,17 +16,18 @@
 #include <SimpleTimer.h>
 #include <PubSubclient.h>
 #include <SimpleFTPServer.h>
+#include <queue>
 
 #define FOR(i, b, e) for(int i = b; i < e; i++)
 
 #define AUTH_WRONG -1
 #define FAILED -1
+#define MQTT_MSG_QUEUE_SIZE 4
+#define MQTT_MSG_CHUNK_SIZE 512
 
 void _callback(FtpOperation ftpOperation, unsigned int freeSpace, unsigned int totalSpace);
 void _transferCallback(FtpTransferOperation ftpOperation, const char* name, unsigned int transferredSize);
 void mqtt_callback(char* topic, uint8_t* payload, unsigned int length);
-
-FtpServer ftpSrv;
 
 typedef struct Wifi_info {
     String ssid;
@@ -45,6 +46,7 @@ class Network_Handler {
         bool isConnecting;  // 연결 시도 중을 명시적으로 표현하기 위해 생성
         bool isDEBUG_mode;
         int16_t wifi_cnt;
+        
         SimpleTimer reScanTimer;
         SimpleTimer connectingTimer;
         SimpleTimer reconnectMQTT_Timer;
@@ -53,11 +55,26 @@ class Network_Handler {
         WiFiClientSecure espclient;
         PubSubClient mqtt_client;
         
+        FtpServer ftpSrv;
+        
+        // WiFi에 연결 or 끊겼을 때 동작시킬 외부 함수 ( 콜백 )
+        std::vector<std::function<void()>> onConnect_cb_list;
+        std::vector<std::function<void()>> onDisconnect_cb_list;
+        
+        // MQTT브로커 서버에 연결되지 않았을 때 메시지 임시 저장소
+        std::queue<std::pair<String, String>> pending_msgs;
+        
     public:
         Network_Handler() = default;
         Network_Handler& operator=(const Network_Handler& ref) = delete;  
         static Network_Handler& GetInstance();
         String getSSID() { return current_info.ssid; }
+        
+        // 와이파이가 연결되었을 때 호출 시키고 싶은 함수를 등록 ( 반환형: void, 인자: void )
+        void reg_connected_callback(std::function<void()> cb_func);
+        
+        // 와이파이가 연결해제 됐을 때 호출 시키고 싶은 함수를 등록 ( 반환형: void, 인자: void )
+        void reg_disconnected_callback(std::function<void()> cb_func);
         
         // 초기화
         void init();
@@ -97,7 +114,9 @@ class Network_Handler {
 
         // mqtt publish
         void publish(String topic, String msg);
-          
+        
+        void publish(String topic, String *msg);
+        
         // non-blocking 실행
         void run();
     
@@ -115,7 +134,7 @@ void Network_Handler::init() {
     reScanTimer.setInterval(5000);
     connectingTimer.setInterval(100); 
     reconnectMQTT_Timer.setInterval(2000);
-    connect_timeout_Timer.setInterval(5000);
+    connect_timeout_Timer.setInterval(8000);
     mqtt_client.setClient(espclient);
     mqtt_client.setCallback(nullptr);
     isConnected = false;
@@ -240,10 +259,24 @@ void Network_Handler::reconnect() {
     mqtt_clientId += String(random(0xffff), HEX);
 
     if (mqtt_client.connect(mqtt_clientId.c_str(), env.mqtt.user_id, env.mqtt.user_password)) {
-        Serial.println("connected!!");
+        Serial.println("MQTT Broker connected!!");
+        
+        // 만약, 연결해제 상태에서 MQTT브로커 서버로 보낼 메시지가 있었을 때
+        while (!pending_msgs.empty()) {
+            auto [topic, msg] = pending_msgs.front();
+
+            Serial.println("묵혀온 메시지 전송! -> " + msg);
+
+            publish(topic.c_str(), msg.c_str());
+            pending_msgs.pop();
+        }
 
         // 접속이 완료되면 본인의 내부아이피 주소 전송
-        mqtt_client.publish("status", ("wake-up! : " + WiFi.localIP().toString()).c_str());
+        char tmp[32]; memset(tmp, '\0', 32);
+
+        sprintf(tmp, "wake-up! : %s", WiFi.localIP().toString().c_str());
+        publish("status", tmp);
+        
         mqtt_client.subscribe("cmd");
     } else {
         Serial.print("failed, rc=");
@@ -268,7 +301,83 @@ void Network_Handler::setMQTT() {
 }
 
 void Network_Handler::publish(String topic, String msg) {
-    mqtt_client.publish(topic.c_str(), msg.c_str());
+    if (mqtt_client.connected()) {
+        char name_prefix[32]; memset(name_prefix, '\0', 32);
+        
+        // 현재 기기의 이름을 접두사로 해서 전송합니다
+        sprintf(name_prefix, "[%s] ", env.getName().c_str());
+
+        mqtt_client.beginPublish(topic.c_str(), msg.length()+strlen(name_prefix), false);
+        mqtt_client.print(name_prefix);
+        mqtt_client.print(msg.c_str());
+        mqtt_client.endPublish();
+
+        return;
+    } 
+    
+    try {
+        if (MQTT_MSG_QUEUE_SIZE <= pending_msgs.size())     
+            throw "큐의 크기를 초과 합니다";
+        if (256 < msg.length())       
+            throw "보관할 메시지가 너무 깁니다";
+        
+        Serial.printf("[메시지 저장] Broker 서버 연결 시 전송합니다!\n");
+        
+        pending_msgs.push({topic, msg});
+    }
+    catch (const char* err) {
+        Serial.printf("[메시지 드랍] 사유: %s\n", err);
+    }
+}
+
+void Network_Handler::publish(String topic, String *msg) {
+    if (mqtt_client.connected()) {
+        char name_prefix[32]; memset(name_prefix, '\0', 32);
+        
+        // 현재 기기의 이름을 접두사로 해서 전송합니다
+        sprintf(name_prefix, "[%s] ", env.getName().c_str());
+        
+        mqtt_client.beginPublish(topic.c_str(), msg->length()+strlen(name_prefix), false);
+        mqtt_client.print(name_prefix);
+        
+        if (MQTT_MSG_CHUNK_SIZE < msg->length()) {
+            Serial.printf("메시지 크기 큼!!! 분할해서 송신!!! (%d)\n", msg->length());
+            
+            for (size_t i = 0; i < msg->length(); i += MQTT_MSG_CHUNK_SIZE) {
+                int len = std::min((size_t)MQTT_MSG_CHUNK_SIZE, msg->length() - i);
+                
+                int written = mqtt_client.write((const uint8_t*)(msg->c_str() + i), len);
+                
+                if (written != len) {
+                    Serial.println("MQTT chunk write failed");
+                    mqtt_client.endPublish();
+                    
+                    return;
+                }
+            }
+            
+            return;
+        }
+        
+        mqtt_client.print(msg->c_str());
+        mqtt_client.endPublish();
+
+        return;
+    } 
+    
+    try {
+        if (MQTT_MSG_QUEUE_SIZE <= pending_msgs.size())     
+            throw "큐의 크기를 초과 합니다";
+        if (256 < msg->length())       
+            throw "보관할 메시지가 너무 깁니다";
+        
+        Serial.printf("[메시지 저장] Broker 서버 연결 시 전송합니다!\n");
+        
+        pending_msgs.push({topic, *msg});
+    }
+    catch (const char* err) {
+        Serial.printf("[메시지 드랍] 사유: %s\n", err);
+    }
 }
     
 void Network_Handler::run() {
@@ -281,10 +390,18 @@ void Network_Handler::run() {
         #ifdef LED_HANDLER_H 
         led.set(2000, 50, 5);
         #endif
+        
+         // 등록한 콜백함수 실행 ( 연결해제 됐을 때 )
+        for(std::function<void()> fn_ptr : onDisconnect_cb_list) {
+            fn_ptr();
+        }
 
         // 완전한 중단
         WiFi.disconnect(true, true);
         WiFi.mode(WIFI_OFF);
+        espclient.stop();
+        espclient = WiFiClientSecure();  // 새 인스턴스 할당 ← ★ 중요!
+        espclient.setInsecure();
         
         // 명시적으로 접속 해제를 표시
         isConnected = false;
@@ -340,6 +457,11 @@ void Network_Handler::run() {
             // MQTT브로커 서버 연결 시작
             setMQTT();
             
+            // 등록한 콜백함수 실행 ( 연결됐을 때 )
+            for(std::function<void()> fn_ptr : onConnect_cb_list) {
+                fn_ptr();
+            }
+            
             if (LittleFS.begin(true)) {
                 ftpSrv.setCallback(_callback);
                 ftpSrv.setTransferCallback(_transferCallback);
@@ -388,8 +510,10 @@ void Network_Handler::run() {
         reconnectMQTT_Timer.reset();
     }
     
-    mqtt_client.loop();
-    ftpSrv.handleFTP();
+    if (isConnected) {
+        mqtt_client.loop();
+        ftpSrv.handleFTP();
+    }
 }
 
 /////////////////////////////////// 일반 함수 들
@@ -438,6 +562,5 @@ void mqtt_callback(char* topic, uint8_t* payload, unsigned int length) {
     
     net.set_mqtt_recv(recv);
 }
-
 
 #endif
